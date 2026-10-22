@@ -1,0 +1,156 @@
+name: Fork Sync & Release
+
+# 定时同步上游 chen08209/FlClash 的「最新正式 release tag」（排除 prerelease，绝不使用未发布的 main 快照），
+# 重打本 fork 的包名(com.flclash.fork)与自有签名，构建 Android APK 并发布到 "fork-latest" Release。
+on:
+  schedule:
+    - cron: '17 18 * * *'   # 每天 02:17 (北京时间) 检查上游
+  workflow_dispatch:        # 手动触发：无论上游有无更新都会重新构建并发布
+
+permissions:
+  contents: write
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          token: ${{ secrets.GITHUB_TOKEN }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Sync upstream release tag & re-apply fork patches
+        id: sync
+        env:
+          EVENT: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BEFORE=$(git rev-parse HEAD)
+          git remote add upstream https://github.com/chen08209/FlClash.git \
+            || git remote set-url upstream https://github.com/chen08209/FlClash.git
+          git fetch upstream --tags
+
+          # 仅取上游「最新正式发布」tag（排除 prerelease），绝不使用未发布的 main 快照
+          TAG=$(gh release list --repo chen08209/FlClash --limit 100 \
+                  --json tagName,isPrerelease,publishedAt \
+                  --jq '[.[] | select(.isPrerelease==false)] | sort_by(.publishedAt) | reverse | .[0].tagName')
+          if [ -z "$TAG" ]; then
+            echo "no upstream release found, falling back to upstream/main"
+            TAG=upstream/main
+          fi
+          echo "target upstream tag: $TAG"
+
+          # 把 main 重置为该正式 tag（丢弃分叉提交，避免合并冲突）
+          git reset --hard "$TAG"
+          git submodule update --init --recursive
+
+          # 恢复本 fork 自己的 CI 工作流文件（重置会把它一并清掉；从本次运行的提交恢复，保证工作流自身持久化）
+          git checkout "$BEFORE" -- .github/workflows/fork.yml
+
+          # 只重打 applicationId（决定安装身份/签名身份，与签名密钥绑定，从而绕开按原包名 com.follow.clash 的安装限制）。
+          # 注意：Dart 的 packageName 常量【不】改——它只用来拼 Flutter 方法通道名，而原生侧由 Components.PACKAGE_NAME
+          # 统一定义为 com.follow.clash；该常量同时是自身组件类名前缀（com.follow.clash.MainActivity 等），
+          # 改了反而破坏「通道匹配」与「Activity 启动」。所以包名常量保持上游值，让 Dart 与原生通道对得上。
+          sed -i 's/^\([[:space:]]*\)applicationId = ".*"/\1applicationId = "com.flclash.fork"/' android/app/build.gradle.kts
+
+          git add -A
+          # 是否「真正存在上游源码更新」：排除工作流文件自身（它本就只存在于 fork，不应触发重建判定）
+          REALCHANGED=false
+          if ! git diff --cached --quiet -- ':!.github/workflows/fork.yml'; then
+            REALCHANGED=true
+          fi
+          CHANGED=$REALCHANGED
+          # 手动触发时总是重新构建并发布
+          if [ "$EVENT" = "workflow_dispatch" ]; then CHANGED=true; fi
+          # 上游有变化才提交/推送（避免无意义的 force push）；工作流文件随源码提交一起被保留
+          if [ "$REALCHANGED" = "true" ]; then
+            git commit -m "chore: sync upstream $TAG + fork package patches"
+            git push --force origin main
+          fi
+          echo "changed=$CHANGED" >> "$GITHUB_OUTPUT"
+          echo "target_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Android Signing
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          echo "${{ secrets.KEYSTORE }}" | base64 --decode > android/app/keystore.jks
+          {
+            echo "keyAlias=${{ secrets.KEY_ALIAS }}"
+            echo "storePassword=${{ secrets.STORE_PASSWORD }}"
+            echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+          } >> android/local.properties
+
+      - name: Setup Go
+        if: steps.sync.outputs.changed == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.1'
+          cache: true
+          cache-dependency-path: core/go.sum
+
+      - name: Setup Gradle
+        if: steps.sync.outputs.changed == 'true'
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Setup Flutter
+        if: steps.sync.outputs.changed == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: '3.47.6'
+          cache: true
+
+      - name: Setup NDK
+        if: steps.sync.outputs.changed == 'true'
+        uses: nttld/setup-ndk@v1
+        id: build-ndk
+        with:
+          ndk-version: r28c
+          add-to-path: true
+          link-to-sdk: true
+
+      - name: Get Flutter Dependency
+        if: steps.sync.outputs.changed == 'true'
+        run: |
+          flutter --version
+          flutter pub get
+
+      - name: Fetch CA certificates
+        if: steps.sync.outputs.changed == 'true'
+        shell: bash
+        env:
+          CA_BUNDLE: cacert-2026-09-25.pem
+          CA_BUNDLE_SHA256: a41b5d356aea97a529fe27e0f7316d2f9d946d75927476cf9cf1b90637d00505
+        run: |
+          bundle=core/Clash.Meta/component/ca/ca-certificates.crt
+          curl -fsSL --retry 3 -o "$bundle" "https://curl.se/ca/$CA_BUNDLE"
+          echo "$CA_BUNDLE_SHA256  $bundle" | sha256sum -c -
+
+      - name: Build APK (core + distributor)
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          ANDROID_NDK_HOME: ${{ steps.build-ndk.outputs.ndk-path }}
+        # 只构建 arm64-v8a（--arch arm64），不再产出 armeabi-v7a / x86_64，
+        # 覆盖几乎所有现代安卓设备，构建更快、产物更小。
+        run: dart setup.dart android --arch arm64 --env stable -v
+
+      - name: Publish / refresh "fork-latest" release
+        if: steps.sync.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          TAG=fork-latest
+          SRC=${{ steps.sync.outputs.target_tag }}
+          gh release delete "$TAG" --cleanup-tag -y || true
+          NOTES="Automated build synced from upstream chen08209/FlClash @ ${SRC} (formal release tag, NOT a main snapshot). Package: com.flclash.fork (renamed to avoid package-name install restrictions / signature conflicts). Signed with this fork's own keystore. Architecture: arm64-v8a ONLY (covers all modern Android devices; 32-bit armeabi-v7a / x86_64 builds are no longer produced). Built at $(date -u)."
+          gh release create "$TAG" $(find dist -name '*.apk') \
+            --title "FlClash Fork ${SRC} ($(date -u +%Y-%m-%d))" \
+            --notes "$NOTES"
