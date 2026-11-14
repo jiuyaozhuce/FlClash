@@ -1,11 +1,14 @@
 name: build
 
+# 本仓库是 fork。上游这套 CI 的 build/upload job 带
+# `github.repository == 'chen08209/FlClash'` 条件，在这里永远 skip；其余检查
+# （尤其 Verify changelog）依赖上游完整的 tag / changelog.json / conventional
+# commit 历史，而 fork.yml 每次 `git reset --hard` 到上游 release tag 后 force
+# push，这段历史无法派生出上游的 changelog，校验必然失败并产生失败通知。
+# fork 的同步、签名构建与发布全部由 fork.yml 负责，故此处只保留手动触发：
+# 既不浪费 Actions 额度，也不会在每次 push 后刷出一串失败提示。想跑代码检查
+# 时仍可手动 dispatch。
 on:
-  push:
-    branches:
-      - '**'
-    tags:
-      - 'v*'
   workflow_dispatch:
 
 concurrency:
@@ -64,8 +67,10 @@ jobs:
         run: |
           yq -i '.hooks.user_defines.setup.build_assets = false' pubspec.yaml
 
+      # 上游 changelog 校验需要上游自身的 tag 与提交历史；fork 的 force-push
+      # 历史派生不出同样的 changelog.json，因此仅在上游仓库执行。
       - name: Verify changelog
-        if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+        if: github.repository == 'chen08209/FlClash' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/'))
         run: dart run tool/changelog.dart verify
 
       - name: Run tests
