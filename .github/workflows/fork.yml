@@ -1,10 +1,8 @@
 name: Fork Sync & Release
 
-# 定时同步上游 chen08209/FlClash 的「最新正式 release tag」（排除 prerelease，绝不使用未发布的 main 快照），
-# 重打本 fork 的包名(com.flclash.fork)与自有签名，构建 Android APK 并发布到与上游同名的 Release tag（如 v0.9.2），版本号完全跟随上游。
+# 仅手动触发：无论上游有无更新都会重新构建并发布
+# schedule 已移除，避免每日自动检查因网络问题导致 workflow 报错
 on:
-  schedule:
-    - cron: '17 18 * * *'   # 每天 02:17 (北京时间) 检查上游
   workflow_dispatch:        # 手动触发：无论上游有无更新都会重新构建并发布
 
 permissions:
